@@ -13,7 +13,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// نفس هيكل البيانات الأصلي
 type Product struct {
 	SKU            string `gorm:"primaryKey"`
 	Category       string
@@ -22,7 +21,7 @@ type Product struct {
 	Description    string
 	Mediators      string
 	Images         string `gorm:"type:text"`
-	SellerLink     string // سيصبح رابط حساب التيليجرام هنا
+	SellerLink     string
 	IsReserved     bool   `gorm:"default:false"`
 	ReservedUntil  time.Time
 	CreatedAt      time.Time
@@ -30,28 +29,17 @@ type Product struct {
 
 var DB *gorm.DB
 var UserStates = make(map[int64]map[string]string)
-var AdminID int64 = 0 // سيتم التعرف عليه عند أول رسالة منك
 var FixedMediators = "احمد فرقان / Ayoub wolf / ma ski"
 
 func main() {
-	// 1. الاتصال بقاعدة البيانات (نفس الرابط الداخلي في Render)
 	dsn := os.Getenv("DATABASE_URL")
 	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatal("فشل الاتصال بالقاعدة:", err)
-	}
-	DB.AutoMigrate(&Product{})
+	if err == nil { DB.AutoMigrate(&Product{}) }
 
-	// 2. تشغيل بوت تيليجرام
 	botToken := os.Getenv("TELEGRAM_APITOKEN")
 	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		log.Fatal("فشل تشغيل البوت:", err)
-	}
-
-	bot.Debug = true
-	log.Printf("تم التشغيل على حساب: %s", bot.Self.UserName)
+	if err != nil { log.Panic(err) }
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -59,49 +47,42 @@ func main() {
 
 	for update := range updates {
 		if update.Message == nil { continue }
-
 		uid := update.Message.Chat.ID
 		text := update.Message.Text
-		
-		// التقاط الصور
 		var photoID string
 		if update.Message.Photo != nil {
-			// نأخذ أعلى جودة للصورة
 			photoID = update.Message.Photo[len(update.Message.Photo)-1].FileID
 		}
-
-		handleLogic(bot, uid, text, photoID, update.Message.From.UserName)
+		logicHandler(bot, uid, text, photoID, update.Message.From.UserName)
 	}
 }
 
-func handleLogic(bot *tgbotapi.BotAPI, uid int64, text string, photoID string, username string) {
+func logicHandler(bot *tgbotapi.BotAPI, uid int64, text string, photoID string, username string) {
 	state, exists := UserStates[uid]
 	lowerText := strings.ToLower(text)
 
-	// أوامر المدير
-	if lowerText == "لوحة التحكم" && uid == AdminID {
-		sendMsg(bot, uid, "أهلاً يا شيخ! 👑\n- (حذف SKU) للحذف\n- (حجز SKU) للحجز")
+	if isAdmin(uid) && handleAdminCommands(bot, uid, lowerText) { return }
+
+	if strings.HasPrefix(lowerText, "حجز ") {
+		sku := strings.ToUpper(strings.TrimPrefix(lowerText, "حجز "))
+		reserveProduct(bot, uid, sku)
 		return
 	}
 
 	if !exists || lowerText == "/start" || lowerText == "مرحبا" {
 		UserStates[uid] = map[string]string{"step": "CHOOSING", "img_list": ""}
-		sendMsg(bot, uid, "مرحبا بك في متجر النخبة (تيليجرام) 🛒\n- أرسل (شراء) للبحث\n- أرسل (بيع) للعرض\n- أرسل (بحث) برمز SKU")
+		sendMsg(bot, uid, "مرحبا بك في متجر النخبة 🛒\n- (شراء) للبحث\n- (بيع) للعرض\n- (بحث) برمز SKU\n- (حجز SKU) للحجز")
 		return
 	}
 
 	step := state["step"]
-
-	// نظام الصور (9 صور كحد أقصى)
 	if step == "SELL_DESC" {
 		if photoID != "" {
 			current := state["img_list"]
-			count := strings.Count(current, "|")
-			if current == "" { count = -1 }
-			if count < 8 {
+			if strings.Count(current, "|") < 8 {
 				if current == "" { current = photoID } else { current += "|" + photoID }
 				UserStates[uid]["img_list"] = current
-				sendMsg(bot, uid, fmt.Sprintf("✅ تم استلام الصورة (%d/9). أرسل المزيد أو (تم).", count+2))
+				sendMsg(bot, uid, "✅ تم استلام الصورة. أرسل المزيد أو (تم).")
 			}
 			return
 		}
@@ -112,13 +93,12 @@ func handleLogic(bot *tgbotapi.BotAPI, uid int64, text string, photoID string, u
 		}
 	}
 
-	// منطق البيع والشراء (نفس التدرج)
 	if lowerText == "بيع" || strings.HasPrefix(step, "SELL_") {
 		handleSale(bot, uid, text, state, username)
 	} else if lowerText == "شراء" || strings.HasPrefix(step, "WAIT_") {
 		handlePurchase(bot, uid, text, state)
 	} else if lowerText == "بحث" || step == "QUICK_SEARCH" {
-		handleSearch(bot, uid, text, state)
+		handleQuickSearch(bot, uid, text)
 	}
 }
 
@@ -126,7 +106,7 @@ func handleSale(bot *tgbotapi.BotAPI, uid int64, text string, state map[string]s
 	switch state["step"] {
 	case "CHOOSING":
 		UserStates[uid]["step"] = "SELL_CAT"
-		sendMsg(bot, uid, "ماذا تبيع؟ (فري فاير / ببجي / بيس / خدمة)")
+		sendMsg(bot, uid, "ماذا تبيع؟ (فري فاير/ببجي/بيس/خدمة)")
 	case "SELL_CAT":
 		UserStates[uid]["s_cat"] = text
 		UserStates[uid]["step"] = "SELL_PAY"
@@ -142,22 +122,65 @@ func handleSale(bot *tgbotapi.BotAPI, uid int64, text string, state map[string]s
 	case "SELL_MED":
 		sku := generateSKU()
 		sLink := "https://t.me/" + username
-		p := Product{
-			SKU: sku, Category: state["s_cat"], PaymentMethods: state["s_pay"],
-			PriceVal: state["s_price"], Description: state["s_desc"],
-			Mediators: text, Images: state["img_list"], SellerLink: sLink,
-			CreatedAt: time.Now(),
-		}
+		p := Product{SKU: sku, Category: state["s_cat"], PaymentMethods: state["s_pay"], PriceVal: state["s_price"], Description: state["s_desc"], Mediators: text, Images: state["img_list"], SellerLink: sLink, CreatedAt: time.Now()}
 		DB.Create(&p)
-		sendMsg(bot, uid, "✅ تم التسجيل! الرمز: "+sku+"\nرابط حسابك أضيف تلقائياً.")
+		sendMsg(bot, uid, "✅ تم التسجيل! الرمز: "+sku)
 		UserStates[uid] = map[string]string{"step": "START"}
 	}
 }
 
-// دوال مساعدة للتيليجرام
+func handlePurchase(bot *tgbotapi.BotAPI, uid int64, text string, state map[string]string) {
+	switch state["step"] {
+	case "CHOOSING":
+		UserStates[uid]["step"] = "WAIT_CAT"
+		sendMsg(bot, uid, "ما الصنف المطلوب؟")
+	case "WAIT_CAT":
+		UserStates[uid]["cat"] = text
+		var products []Product
+		DB.Where("category ILIKE ? AND is_reserved = ?", "%"+text+"%", false).Limit(5).Find(&products)
+		if len(products) == 0 {
+			sendMsg(bot, uid, "❌ لا توجد نتائج حالياً.")
+		} else {
+			for _, p := range products {
+				res := fmt.Sprintf("📦 الرمز: %s\n💰 السعر: %s\n📝 الوصف: %s\n👤 بائع: %s", p.SKU, p.PriceVal, p.Description, p.SellerLink)
+				sendMsg(bot, uid, res)
+			}
+		}
+		UserStates[uid] = map[string]string{"step": "START"}
+	}
+}
+
+func handleQuickSearch(bot *tgbotapi.BotAPI, uid int64, text string) {
+	if strings.ToLower(text) == "بحث" {
+		UserStates[uid]["step"] = "QUICK_SEARCH"
+		sendMsg(bot, uid, "أدخل رمز SKU:")
+		return
+	}
+	var p Product
+	if DB.First(&p, "sku = ?", strings.ToUpper(text)).Error == nil {
+		res := fmt.Sprintf("🔍 تفاصيل %s:\n💰 السعر: %s\n📝 الوصف: %s\n👤 بائع: %s", p.SKU, p.PriceVal, p.Description, p.SellerLink)
+		sendMsg(bot, uid, res)
+		if p.Images != "" {
+			for _, img := range strings.Split(p.Images, "|") {
+				bot.Send(tgbotapi.NewPhoto(uid, tgbotapi.FileID(img)))
+			}
+		}
+	} else { sendMsg(bot, uid, "❌ رمز غير موجود.") }
+	UserStates[uid] = map[string]string{"step": "START"}
+}
+
+func reserveProduct(bot *tgbotapi.BotAPI, uid int64, sku string) {
+	var p Product
+	if DB.First(&p, "sku = ?", sku).Error == nil {
+		p.IsReserved = true
+		p.ReservedUntil = time.Now().Add(24 * time.Hour)
+		DB.Save(&p)
+		sendMsg(bot, uid, "✅ تم الحجز لـ 24 ساعة.")
+	} else { sendMsg(bot, uid, "❌ الرمز خاطئ.") }
+}
+
 func sendMsg(bot *tgbotapi.BotAPI, uid int64, text string) {
-	msg := tgbotapi.NewMessage(uid, text)
-	bot.Send(msg)
+	bot.Send(tgbotapi.NewMessage(uid, text))
 }
 
 func generateSKU() string {
@@ -167,5 +190,3 @@ func generateSKU() string {
 	for i := range b { b[i] = chars[r.Intn(len(chars))] }
 	return string(b)
 }
-
-// ... (تكملة دوال handlePurchase و handleSearch بنفس المنطق)
