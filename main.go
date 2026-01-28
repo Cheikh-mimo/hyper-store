@@ -11,45 +11,44 @@ import (
 	"gorm.io/gorm"
 )
 
-// --- الهياكل البيانات ---
-type User struct {
-	gorm.Model
-	TelegramID int64 `gorm:"uniqueIndex"`
-	Username   string
-	Points     int `gorm:"default:0"`
-}
-
-type Product struct {
-	gorm.Model
-	SKU      string `gorm:"uniqueIndex"`
-	Name     string
-	Category string
-	Price    string
-	Seller   string
-}
-
 var DB *gorm.DB
 
-// --- لوحة الأزرار الرئيسية ---
+// --- القائمة الرئيسية ---
 func getMainMenu() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("💰 بيع منتج", "sell"),
-			tgbotapi.NewInlineKeyboardButtonData("🛒 شراء منتج", "buy"),
+			tgbotapi.NewInlineKeyboardButtonData("💰 بيع منتج", "menu_sell"),
+			tgbotapi.NewInlineKeyboardButtonData("🛒 شراء منتج", "menu_buy"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔍 بحث بالرمز", "search"),
-			tgbotapi.NewInlineKeyboardButtonData("📦 آخر المنتجات", "latest"),
+			tgbotapi.NewInlineKeyboardButtonData("🔍 بحث بالرمز", "menu_search"),
+			tgbotapi.NewInlineKeyboardButtonData("📦 آخر المنتجات", "menu_latest"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🎫 استخدام الكود", "use_code"),
-			tgbotapi.NewInlineKeyboardButtonData("🎁 استبدال النقاط", "redeem"),
+			tgbotapi.NewInlineKeyboardButtonData("🎫 استخدام الكود", "menu_code"),
+			tgbotapi.NewInlineKeyboardButtonData("🎁 استبدال النقاط", "menu_redeem"),
+		),
+	)
+}
+
+// --- قائمة الفئات (تظهر عند الضغط على بيع) ---
+func getCategoryMenu() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🎮 Free Fire", "cat_ff"),
+			tgbotapi.NewInlineKeyboardButtonData("🔫 PUBG", "cat_pubg"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚽ EFOOTBALL", "cat_ef"),
+			tgbotapi.NewInlineKeyboardButtonData("💳 Google Play", "cat_gp"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔙 رجوع", "go_back"),
 		),
 	)
 }
 
 func main() {
-	// 1. تشغيل سيرفر الويب لـ Render
 	go func() {
 		port := os.Getenv("PORT")
 		if port == "" { port = "8080" }
@@ -57,43 +56,25 @@ func main() {
 		http.ListenAndServe(":"+port, nil)
 	}()
 
-	// 2. الاتصال بقاعدة البيانات
 	dsn := os.Getenv("DATABASE_URL")
 	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatalf("خطأ اتصال: %v", err)
-	}
+	if err != nil { log.Fatal(err) }
 
-	// 🔥 الحل السحري: حذف الجداول القديمة تماماً لإنهاء تعارض الـ SKU
-	// ملاحظة: احذف هذين السطرين بعد أول تشغيل ناجح لكي لا تفقد بياناتك لاحقاً
-	DB.Migrator().DropTable(&Product{}, &User{}) 
-	log.Println("تم تنظيف الجداول القديمة بنجاح")
-
-	// 3. إنشاء الجداول من جديد بالخصائص الصحيحة
-	DB.AutoMigrate(&User{}, &Product{})
-
-	// 4. تشغيل البوت
 	bot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_APITOKEN"))
 	if err != nil { log.Panic(err) }
-
-	log.Printf("تم التشغيل على حساب: %s", bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
-		// معالجة الضغط على الأزرار
 		if update.CallbackQuery != nil {
 			handleCallbacks(bot, update.CallbackQuery)
 			continue
 		}
 
-		if update.Message == nil { continue }
-
-		// معالجة الرسائل
-		if update.Message.Text == "/start" {
+		if update.Message != nil && update.Message.Text == "/start" {
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "مرحباً بك! يرجى اختيار زر من هذه الأزرار:")
 			msg.ReplyMarkup = getMainMenu()
 			bot.Send(msg)
@@ -102,19 +83,34 @@ func main() {
 }
 
 func handleCallbacks(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
+	chatID := query.Message.Chat.ID
+	messageID := query.Message.MessageID
+
 	callbackCfg := tgbotapi.NewCallback(query.ID, "")
 	bot.Request(callbackCfg)
 
-	var text string
+	var editMsg tgbotapi.EditMessageTextConfig
+
 	switch query.Data {
-	case "sell": text = "لقد اخترت: بيع منتج. يرجى إرسال تفاصيل المنتج."
-	case "buy": text = "جاري عرض قائمة المنتجات..."
-	case "search": text = "أدخل رمز البحث الخاص بك:"
-	case "latest": text = "إليك آخر المنتجات المضافة."
-	case "use_code": text = "أدخل كود الشحن:"
-	case "redeem": text = "نقاطك الحالية 0. اجمع 1000 نقطة للاستبدال."
+	case "menu_sell":
+		// هنا نقوم بتعديل الرسالة بدلاً من إرسال واحدة جديدة
+		editMsg = tgbotapi.NewEditMessageText(chatID, messageID, "يرجى تحديد الفئة الخاصة بالمنتج:")
+		menu := getCategoryMenu()
+		editMsg.ReplyMarkup = &menu
+
+	case "go_back":
+		// العودة للقائمة الرئيسية
+		editMsg = tgbotapi.NewEditMessageText(chatID, messageID, "مرحباً بك مجدداً! يرجى الاختيار:")
+		menu := getMainMenu()
+		editMsg.ReplyMarkup = &menu
+
+	case "cat_ff":
+		editMsg = tgbotapi.NewEditMessageText(chatID, messageID, "ممتاز! لقد اخترت Free Fire. أرسل الآن السعر بالعملتين DA أو $:")
+		// يمكن إضافة زر "إلغاء" هنا أيضاً
+	
+	default:
+		editMsg = tgbotapi.NewEditMessageText(chatID, messageID, "عذراً، هذا القسم قيد التطوير.")
 	}
 
-	msg := tgbotapi.NewMessage(query.Message.Chat.ID, text)
-	bot.Send(msg)
+	bot.Send(editMsg)
 }
